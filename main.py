@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Fresh strawberries on a plate -- procedural still life.
+"""The picture that tastes of one ingredient.
 
-One ingredient: fresh strawberries. Pure Python 3.13 stdlib, no network,
-no external assets. Writes one 1024x1024 PNG to /output/entry.png by
-default, or to argv[1] when given. Fully deterministic.
+A procedural still life of fresh strawberries on a white ceramic plate,
+drawn from scratch with the Python standard library only. No image files,
+no network, no third-party packages: every pixel is computed here, and
+the PNG encoder below is written by hand (zlib + struct + CRC32).
+
+Run:  python3 main.py [output-path]
+Default output: /output/entry.png (1024x1024, deterministic).
 """
+
 import math
 import os
 import struct
@@ -15,353 +20,343 @@ W = 1024
 H = 1024
 
 
-def clamp(x, lo, hi):
-    return lo if x < lo else hi if x > hi else x
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
 
-def lerp(a, b, t):
+def smooth(a, b, x):
+    """Smoothstep between a and b (requires a < b)."""
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def mix(a, b, t):
     return a + (b - a) * t
 
 
-def mix(c1, c2, t):
-    return (lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t))
+def hash2(ix, iy, salt):
+    """Deterministic integer hash -> float in [0, 1)."""
+    h = (ix * 374761393 + iy * 668265263 + salt * 974634211) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 1274126177) & 0xFFFFFFFF
+    h ^= h >> 16
+    return (h & 0xFFFFFF) / 16777216.0
 
 
-class Canvas:
-    def __init__(self):
-        self.px = bytearray(W * H * 3)
+class Berry:
+    """One strawberry: centre, size, lean and seed layout."""
 
-    def set(self, x, y, r, g, b):
-        if 0 <= x < W and 0 <= y < H:
-            i = (y * W + x) * 3
-            self.px[i] = int(clamp(r, 0, 255))
-            self.px[i + 1] = int(clamp(g, 0, 255))
-            self.px[i + 2] = int(clamp(b, 0, 255))
+    def __init__(self, cx, cy, w, h, lean, seed_salt):
+        self.cx = cx
+        self.cy = cy
+        self.w = w
+        self.h = h
+        self.lean = lean
+        self.salt = seed_salt
+        # Seed positions in berry-local coordinates, fixed by hash.
+        # Also bucket them into a coarse grid so each pixel only tests
+        # the handful of seeds that could possibly cover it.
+        self.seeds = []
+        self.seed_cells = {}
+        for i in range(36):
+            su = hash2(i, 7, seed_salt)
+            sv = hash2(i, 13, seed_salt)
+            # Spread seeds over the berry body, denser near the middle.
+            u = (su - 0.5) * 1.55
+            v = sv * 0.92 - 0.28
+            sr = 0.020 + 0.012 * hash2(i, 29, seed_salt)
+            sx = cx + u * w * 0.5
+            sy = cy + v * h * 0.5
+            seed = (sx, sy, sr)
+            self.seeds.append((u, v, sr))
+            for gx in (int(sx // 28) - 1, int(sx // 28), int(sx // 28) + 1):
+                for gy in (int(sy // 28) - 1, int(sy // 28), int(sy // 28) + 1):
+                    self.seed_cells.setdefault((gx, gy), []).append(seed)
 
-    def get(self, x, y):
-        i = (y * W + x) * 3
-        return (self.px[i], self.px[i + 1], self.px[i + 2])
-
-    def blend(self, x, y, r, g, b, a):
-        """Blend colour (r,g,b) over pixel (x,y) with alpha a in [0,1]."""
-        if 0 <= x < W and 0 <= y < H and a > 0:
-            i = (y * W + x) * 3
-            px = self.px
-            px[i] = int(clamp(px[i] + (r - px[i]) * a, 0, 255))
-            px[i + 1] = int(clamp(px[i + 1] + (g - px[i + 1]) * a, 0, 255))
-            px[i + 2] = int(clamp(px[i + 2] + (b - px[i + 2]) * a, 0, 255))
-
-    def disc(self, cx, cy, rad, r, g, b, a=1.0):
-        """Filled disc, centre (cx,cy), radius rad (float)."""
-        if rad <= 0:
-            return
-        x0 = max(0, int(cx - rad) - 1)
-        x1 = min(W - 1, int(cx + rad) + 1)
-        y0 = max(0, int(cy - rad) - 1)
-        y1 = min(H - 1, int(cy + rad) + 1)
-        r2 = rad * rad
-        for y in range(y0, y1 + 1):
-            dy = y - cy
-            for x in range(x0, x1 + 1):
-                dx = x - cx
-                if dx * dx + dy * dy <= r2:
-                    if a >= 1.0:
-                        self.set(x, y, r, g, b)
-                    else:
-                        self.blend(x, y, r, g, b, a)
+    def inside(self, x, y):
+        """Shape value: < 0 inside the berry, > 0 outside."""
+        dx = (x - self.cx) / (self.w * 0.5)
+        dy = (y - self.cy) / (self.h * 0.5) + self.lean * dx * 0.35
+        # The berry narrows toward its tip (dy -> +1).
+        taper = 1.0 - 0.52 * smooth(-0.1, 1.0, dy)
+        taper = max(taper, 0.28)
+        qx = dx / taper
+        # Slightly flattened shoulders at the top.
+        r = math.sqrt(qx * qx + dy * dy)
+        # Push the top edge out a touch for plump shoulders.
+        r -= 0.06 * math.exp(-((dy + 0.55) * (dy + 0.55)) / 0.08)
+        return r - 1.0
 
 
-def background(cv):
-    # Deterministic linen tile, 64x64 values in -7..7. Per-cell LCG hash
-    # (uncorrelated across cells) so the grain reads as fine linen,
-    # not diagonal bands.
-    tile = []
-    for ty in range(64):
-        row = []
-        for tx in range(64):
-            seed = tx * 57 + ty * 131 + 17
-            n = ((seed * 9301 + 49297) % 233280) / 233280.0
-            row.append(int(n * 15) - 7)
-        tile.append(row)
-    top = (255, 246, 228)
-    bot = (243, 212, 176)
-    px = cv.px
+def berry_colour(berry, x, y, shape):
+    """Fresh red flesh: bright lit top-left, deep red base, gloss."""
+    dx = (x - berry.cx) / (berry.w * 0.5)
+    dy = (y - berry.cy) / (berry.h * 0.5)
+    # Light comes from the upper left.
+    light = clamp(0.72 - 0.55 * dx - 0.45 * dy, 0.0, 1.0)
+    # Vertical ripeness gradient: glowing red up top, wine red at tip.
+    grad = clamp(0.5 - dy * 0.5, 0.0, 1.0)
+    base_r = mix(168.0, 232.0, grad)
+    base_g = mix(18.0, 74.0, grad)
+    base_b = mix(26.0, 58.0, grad)
+    # Warm light lift + cool shadow falloff.
+    lift = 0.62 + 0.55 * light
+    r = base_r * lift
+    g = base_g * lift
+    b = base_b * lift
+    # Fine skin speckle: tiny darker pores, deterministic, cheap hash.
+    n = ((x * 374761393 + y * 668265263 + 3 * 974634211) & 0xFFFFFFFF) % 1000 / 1000.0
+    if n < 0.10:
+        r *= 0.88
+        g *= 0.85
+        b *= 0.88
+    # Soft specular gloss on the upper-left shoulder.
+    gx = (x - (berry.cx - berry.w * 0.26)) / (berry.w * 0.30)
+    gy = (y - (berry.cy - berry.h * 0.30)) / (berry.h * 0.26)
+    gloss = math.exp(-(gx * gx + gy * gy) * 2.2)
+    gloss *= smooth(0.15, 0.75, -shape)  # fade at the very edge
+    r = mix(r, 255.0, gloss * 0.55)
+    g = mix(g, 235.0, gloss * 0.45)
+    b = mix(b, 225.0, gloss * 0.45)
+    # Seeds: small golden ovals, slightly sunk into the skin.
+    # Only the seeds bucketed near this pixel are tested.
+    for (sx, sy, sr) in berry.seed_cells.get((int(x // 28), int(y // 28)), ()):
+        ex = (x - sx) / (sr * berry.w * 0.5)
+        ey = (y - sy) / (sr * berry.h * 0.5 * 1.5)
+        d = ex * ex + ey * ey
+        if d < 1.0:
+            # Seed sits slightly sunk: darker rim, bright centre.
+            centre = 1.0 - smooth(0.0, 0.55, d)
+            r = mix(r, 226.0, 0.62)
+            g = mix(g, 184.0, 0.62)
+            b = mix(b, 96.0, 0.62)
+            r *= 0.82 + 0.18 * centre
+            g *= 0.82 + 0.18 * centre
+            b *= 0.82 + 0.18 * centre
+            break
+    return (int(clamp(r, 0, 255)), int(clamp(g, 0, 255)),
+            int(clamp(b, 0, 255)))
+
+
+def leaf_colour(x, y, cx, cy, angle, length, width):
+    """One pointed calyx leaf; returns None when outside the leaf."""
+    dx = x - cx
+    dy = y - cy
+    ca = math.cos(angle)
+    sa = math.sin(angle)
+    # Rotate into leaf space: leaf points along +u.
+    u = dx * ca + dy * sa
+    v = -dx * sa + dy * ca
+    if u < -6.0 or u > length:
+        return None
+    t = clamp(u / length, 0.0, 1.0)
+    half = width * (1.0 - t * 0.92) * (0.35 + 0.65 * math.sin(math.pi * min(t * 1.15, 1.0)))
+    if abs(v) > half:
+        return None
+    edge = 1.0 - smooth(half * 0.55, half, abs(v))
+    shade = 0.72 + 0.45 * (1.0 - t) * edge
+    vein = 0.9 + 0.1 * math.cos(v * 0.9)
+    return (int(clamp(52 * shade * vein, 0, 255)),
+            int(clamp(128 * shade * vein, 0, 255)),
+            int(clamp(58 * shade * vein, 0, 255)))
+
+
+def draw_leaf(px, cx, cy, angle, length, width):
+    """Paint one leaf into the pixel buffer (in place)."""
+    x0 = int(cx - length - width - 4)
+    x1 = int(cx + length + width + 4)
+    y0 = int(cy - length - width - 4)
+    y1 = int(cy + length + width + 4)
+    for yy in range(max(0, y0), min(H, y1 + 1)):
+        for xx in range(max(0, x0), min(W, x1 + 1)):
+            c = leaf_colour(xx, yy, cx, cy, angle, length, width)
+            if c is not None:
+                idx = (yy * W + xx) * 3
+                px[idx] = c[0]
+                px[idx + 1] = c[1]
+                px[idx + 2] = c[2]
+
+
+def render():
+    px = bytearray(W * H * 3)
+    # --- Warm cream backdrop, brighter toward the upper left. ---
+    # Glow is separable: glow(x, y) = gx(x) * gy(y); precompute both.
+    gx = [math.exp(-((x / (W - 1) - 0.30) ** 2) * 1.6) for x in range(W)]
+    gy = [math.exp(-((y / (H - 1) - 0.22) ** 2) * 1.6) for y in range(H)]
     for y in range(H):
-        t = y / (H - 1)
-        br = lerp(top[0], bot[0], t)
-        bg = lerp(top[1], bot[1], t)
-        bb = lerp(top[2], bot[2], t)
-        ty = y & 63
-        trow = tile[ty]
-        # Warm glow from top-left, precomputed per-row falloff.
-        dy = y - 120
-        ny = (y - 512) / 512.0
+        fy = y / (H - 1)
+        grow = gy[y]
+        base_r = mix(233.0, 252.0, 1.0 - fy)
+        base_g = mix(214.0, 240.0, 1.0 - fy)
+        base_b = mix(188.0, 222.0, 1.0 - fy)
         row = y * W * 3
         for x in range(W):
-            dx = x - 180
-            d2 = dx * dx + dy * dy
-            glow = 0.0
-            if d2 < 810000:
-                glow = 1.0 - d2 / 810000.0
-            n = trow[x & 63]
-            nx = (x - 512) / 512.0
-            vig = 1.0 - 0.05 * min(1.0, nx * nx + ny * ny)
-            r = (br + 20 * glow + n) * vig
-            g = (bg + 14 * glow + n) * vig
-            b = (bb + 6 * glow + n) * vig
-            i = row + x * 3
-            px[i] = int(clamp(r, 0, 255))
-            px[i + 1] = int(clamp(g, 0, 255))
-            px[i + 2] = int(clamp(b, 0, 255))
+            glow = gx[x] * grow
+            # Faint linen grain, cheap deterministic pattern.
+            grain = (((x * 31 + y * 17) % 11) - 5) * 0.5
+            idx = row + x * 3
+            px[idx] = int(clamp(base_r + 10.0 * glow + grain, 0, 255))
+            px[idx + 1] = int(clamp(base_g + 8.0 * glow + grain, 0, 255))
+            px[idx + 2] = int(clamp(base_b + 6.0 * glow + grain, 0, 255))
 
-
-def ellipse_shadow(cv, cx, cy, rx, ry, strength):
-    x0 = max(0, int(cx - rx))
-    x1 = min(W - 1, int(cx + rx))
-    y0 = max(0, int(cy - ry))
-    y1 = min(H - 1, int(cy + ry))
-    for y in range(y0, y1 + 1):
-        dy = (y - cy) / ry
-        for x in range(x0, x1 + 1):
-            dx = (x - cx) / rx
-            q = dx * dx + dy * dy
-            if q <= 1.0:
-                cv.blend(x, y, 74, 52, 38, strength * (1.0 - q * 0.55))
-
-
-def plate(cv):
-    cx, cy, rx, ry = 512, 668, 402, 168
-    ellipse_shadow(cv, cx, cy + 26, rx + 6, 34, 0.20)
-    x0, x1 = cx - rx - 1, cx + rx + 1
-    y0, y1 = cy - ry - 1, cy + ry + 1
-    for y in range(y0, y1 + 1):
-        dy = (y - cy) / ry
-        for x in range(x0, x1 + 1):
-            dx = (x - cx) / rx
-            q = dx * dx + dy * dy
-            if q > 1.0:
+    # --- Soft contact shadow under the plate. ---
+    pcx, pcy, prx, pry = 512.0, 668.0, 392.0, 158.0
+    for y in range(int(pcy - pry - 30), int(pcy + pry + 34)):
+        if y < 0 or y >= H:
+            continue
+        for x in range(int(pcx - prx - 30), int(pcx + prx + 34)):
+            if x < 0 or x >= W:
                 continue
-            # Light from top-left.
-            light = clamp(0.72 + 0.28 * (-0.7 * dx - 0.7 * dy), 0.0, 1.0)
-            r = 250 + 4 * light
-            g = 249 + 4 * light
-            b = 246 + 4 * light
-            if q > 0.78:  # rim band, slightly darker
-                f = (q - 0.78) / 0.22
-                r = lerp(r, 226, f * 0.7)
-                g = lerp(g, 224, f * 0.7)
-                b = lerp(b, 218, f * 0.7)
-            elif q < 0.46:  # well, slightly warmer / darker
-                f = 1.0 - q / 0.46
-                r = lerp(r, 240, f * 0.55)
-                g = lerp(g, 236, f * 0.55)
-                b = lerp(b, 226, f * 0.55)
-            if 0.965 < q <= 1.0:  # thin rim line
-                r, g, b = 198, 194, 186
-            cv.set(x, y, r, g, b)
+            ex = (x - pcx) / (prx + 26.0)
+            ey = (y - (pcy + 14.0)) / (pry + 22.0)
+            d = math.sqrt(ex * ex + ey * ey)
+            sh = (1.0 - smooth(0.72, 1.0, d)) * 0.34
+            if sh > 0.0:
+                idx = (y * W + x) * 3
+                px[idx] = int(px[idx] * (1.0 - sh))
+                px[idx + 1] = int(px[idx + 1] * (1.0 - sh))
+                px[idx + 2] = int(px[idx + 2] * (1.0 - sh))
 
-
-def berry_halfwidth(v):
-    """Half-width factor at normalised height v in [0,1], top to tip."""
-    hw = (1.0 - v ** 3.0) ** 0.42 * (0.94 + 0.06 * math.cos(math.pi * v))
-    if v < 0.18:
-        # Narrower at the very top so the shoulder rounds over instead
-        # of ending in a flat, square-cut top edge.
-        hw *= 0.25 + 0.75 * math.sin(math.pi / 2 * v / 0.18)
-    hw *= 1.0 - 0.12 * v  # stronger taper toward the tip
-    return hw
-
-
-def berry_colour(u, v, hw):
-    # Light from top-left.
-    L = clamp(0.55 + 0.45 * (-0.8 * u - 0.6 * (v - 0.5)), 0.0, 1.0)
-    dark = (138, 12, 10)
-    mid = (205, 28, 18)
-    bright = (242, 74, 40)
-    if L < 0.55:
-        c = mix(dark, mid, L / 0.55)
-    else:
-        c = mix(mid, bright, (L - 0.55) / 0.45)
-    tip = 1.0 - 0.16 * v * v
-    ridge = 1.0 + 0.035 * math.sin(9 * u + 3 * v)
-    r, g, b = c[0] * tip * ridge, c[1] * tip * ridge, c[2] * tip * ridge
-    # Soft white gloss, upper-left of the berry: kept small and tight
-    # so it reads as a highlight, not a pale wash across the berry.
-    du = (u + 0.42) / 0.22
-    dv = (v - 0.28) / 0.16
-    d2 = du * du + dv * dv
-    if d2 < 1.0:
-        a = (1.0 - d2) * 0.35
-        r = lerp(r, 255, a)
-        g = lerp(g, 235, a)
-        b = lerp(b, 220, a)
-    # Warm rim light on the right edge.
-    if u > 0 and hw > 0 and abs(u) > hw * 0.80:
-        a = ((abs(u) / hw - 0.80) / 0.20) * 0.35
-        r = lerp(r, 255, a)
-        g = lerp(g, 176, a)
-        b = lerp(b, 118, a)
-    return r, g, b
-
-
-def draw_leaf(cv, apex, base_ang, spread_deg, length, max_hw):
-    """One lens-shaped calyx leaf from the apex, spread from straight up."""
-    ang = math.radians(base_ang + spread_deg)
-    # Direction: up is -y; spread rotates around it.
-    dx = math.sin(ang)
-    dy = -math.cos(ang)
-    steps = 24
-    pts = []
-    for s in range(steps + 1):
-        t = s / steps
-        hw = max_hw * math.sin(math.pi * (t ** 0.85))
-        px = apex[0] + dx * t * length
-        py = apex[1] + dy * t * length
-        pts.append((px, py, hw, t))
-        if hw > 0.4:
-            cv.disc(px, py, hw, *mix((44, 104, 26), (78, 156, 42), t))
-    # Centre vein, darker.
-    for s in range(4, steps - 2):
-        px, py, hw, t = pts[s]
-        cv.disc(px, py, 1.1, 38, 88, 22)
-
-
-def draw_stem(cv, apex, base_ang):
-    ang = math.radians(base_ang)
-    dx = math.sin(ang)
-    dy = -math.cos(ang)
-    for s in range(0, 27, 3):
-        cv.disc(apex[0] + dx * s, apex[1] + dy * s, 2.6, 101, 78, 43)
-
-
-def draw_droplet(cv, x, y, rad=5.0):
-    cv.disc(x, y, rad, 255, 255, 255, 0.30)
-    cv.disc(x - rad * 0.25, y - rad * 0.3, rad * 0.42, 255, 255, 255, 0.85)
-
-
-def berry(cv, cx, cy, w, h, angle_deg, droplets):
-    """Draw one strawberry. Returns nothing; draws shadow, body, seeds,
-    calyx and stem. Local u in [-1,1] across, v in [0,1] top to tip."""
-    ang = math.radians(angle_deg)
-    ca, sa = math.cos(ang), math.sin(ang)
-    hw2, hh2 = w / 2.0, h / 2.0
-    # Soft shadow on the plate, just under the berry.
-    ellipse_shadow(cv, cx, cy + hh2 * 0.82, w * 0.42, h * 0.085, 0.22)
-
-    # Bounding box of the rotated berry.
-    ex = hw2 * abs(ca) + hh2 * abs(sa)
-    ey = hw2 * abs(sa) + hh2 * abs(ca)
-    x0 = max(0, int(cx - ex) - 1)
-    x1 = min(W - 1, int(cx + ex) + 1)
-    y0 = max(0, int(cy - ey) - 1)
-    y1 = min(H - 1, int(cy + ey) + 1)
-    for y in range(y0, y1 + 1):
-        dy = y - cy
-        for x in range(x0, x1 + 1):
-            dx = x - cx
-            # Inverse rotation into berry-local coords.
-            lx = dx * ca + dy * sa
-            ly = -dx * sa + dy * ca
-            u = lx / hw2
-            v = (ly + hh2) / h
-            if v < 0.0 or v > 1.0 or u < -1.0 or u > 1.0:
+    # --- White ceramic plate: rim, well, inner glaze ring. ---
+    for y in range(int(pcy - pry), int(pcy + pry) + 1):
+        if y < 0 or y >= H:
+            continue
+        for x in range(int(pcx - prx), int(pcx + prx) + 1):
+            if x < 0 or x >= W:
                 continue
-            hw = berry_halfwidth(v)
-            if abs(u) > hw:
+            ex = (x - pcx) / prx
+            ey = (y - pcy) / pry
+            d = math.sqrt(ex * ex + ey * ey)
+            if d >= 1.0:
                 continue
-            r, g, b = berry_colour(u, v, hw)
-            cv.set(x, y, r, g, b)
+            idx = (y * W + x) * 3
+            # Rim catches the light; the well dips slightly warmer.
+            rim = smooth(0.86, 1.0, d)
+            well = smooth(0.72, 0.86, d)
+            r = mix(255.0, 243.0, well) + 6.0 * rim
+            g = mix(253.0, 238.0, well) + 5.0 * rim
+            b = mix(250.0, 228.0, well) + 4.0 * rim
+            # Thin glaze ring near the rim.
+            ring = math.exp(-((d - 0.80) ** 2) / 0.00045)
+            r -= 14.0 * ring
+            g -= 13.0 * ring
+            b -= 11.0 * ring
+            # Gentle top-light shading across the plate.
+            shade = 0.94 + 0.06 * clamp(1.0 - (x / W + y / H), 0.0, 1.0)
+            px[idx] = int(clamp(r * shade, 0, 255))
+            px[idx + 1] = int(clamp(g * shade, 0, 255))
+            px[idx + 2] = int(clamp(b * shade, 0, 255))
 
-    # Apex in canvas coords (local (0, -hh2) rotated).
-    ax = cx + (0 * ca - (-hh2) * sa)
-    ay = cy + (0 * sa + (-hh2) * ca)
-    apex = (ax, ay)
+    # --- Strawberries: two behind, one hero in front. ---
+    berries = [
+        Berry(372.0, 560.0, 300.0, 330.0, -0.10, 101),
+        Berry(662.0, 548.0, 296.0, 322.0, 0.12, 202),
+        Berry(514.0, 618.0, 348.0, 372.0, 0.0, 303),
+    ]
+    # Berry shadows on the plate, painted before the berries.
+    for b in berries:
+        for y in range(int(b.cy + b.h * 0.18), int(b.cy + b.h * 0.62)):
+            if y < 0 or y >= H:
+                continue
+            for x in range(int(b.cx - b.w * 0.62), int(b.cx + b.w * 0.62)):
+                if x < 0 or x >= W:
+                    continue
+                ex = (x - (b.cx + 26.0)) / (b.w * 0.58)
+                ey = (y - (b.cy + b.h * 0.42)) / (b.h * 0.20)
+                d = math.sqrt(ex * ex + ey * ey)
+                sh = (1.0 - smooth(0.55, 1.0, d)) * 0.22
+                if sh > 0.0:
+                    idx = (y * W + x) * 3
+                    px[idx] = int(px[idx] * (1.0 - sh))
+                    px[idx + 1] = int(px[idx + 1] * (1.0 - sh))
+                    px[idx + 2] = int(px[idx + 2] * (1.0 - sh))
+    # Berry bodies, back to front.
+    for b in berries:
+        x0 = int(b.cx - b.w * 0.55)
+        x1 = int(b.cx + b.w * 0.55)
+        y0 = int(b.cy - b.h * 0.55)
+        y1 = int(b.cy + b.h * 0.55)
+        for y in range(max(0, y0), min(H, y1 + 1)):
+            for x in range(max(0, x0), min(W, x1 + 1)):
+                s = b.inside(x, y)
+                if s >= 0.0:
+                    continue
+                c = berry_colour(b, x, y, s)
+                idx = (y * W + x) * 3
+                # Feather the rim by one pixel for a clean edge.
+                a = 1.0 - smooth(-0.045, 0.0, s)
+                px[idx] = int(mix(px[idx], c[0], a))
+                px[idx + 1] = int(mix(px[idx + 1], c[1], a))
+                px[idx + 2] = int(mix(px[idx + 2], c[2], a))
 
-    # Seeds: rows v, spacing 0.30 in u, alternate rows shifted half a step.
-    seed_rows = [0.20, 0.28, 0.40, 0.52, 0.64, 0.76, 0.86, 0.93]
-    srx, sry = 0.0135 * w, 0.017 * h
-    for ri, v in enumerate(seed_rows):
-        hw = berry_halfwidth(v)
-        off = 0.15 if ri % 2 else 0.0
-        u = -0.8 * hw + off
-        while u <= 0.8 * hw:
-            if abs(u) <= 0.8 * hw:
-                # Seed centre, local -> canvas.
-                lx = u * hw2
-                ly = (v - 0.5) * h
-                sx = cx + lx * ca - ly * sa
-                sy = cy + lx * sa + ly * ca
-                # Small dark shadow offset down-right, then pale seed.
-                cv.disc(sx + 1.6, sy + 1.8, srx, 120, 20, 12, 0.55)
-                # Ellipse: draw as a disc squashed vertically via two
-                # passes is overkill; a small disc reads as a seed at
-                # this scale, stretched by drawing a vertical pair.
-                cv.disc(sx, sy, srx, 255, 233, 158)
-                cv.disc(sx, sy - sry * 0.35, srx * 0.7, 255, 233, 158)
-                cv.disc(sx, sy + sry * 0.35, srx * 0.7, 255, 233, 158)
-            u += 0.30
+    # --- Green calyx crowns on each berry. ---
+    for b in berries:
+        top_y = b.cy - b.h * 0.46
+        for k in range(5):
+            ang = -math.pi / 2 + (k - 2) * 0.52 + b.lean * 0.3
+            draw_leaf(px, b.cx, top_y + 6.0, ang,
+                      b.w * 0.30, b.w * 0.085)
+        # Short slim stem, tucked between the leaves.
+        for yy in range(int(top_y - 16), int(top_y + 4)):
+            for xx in range(int(b.cx - 3), int(b.cx + 4)):
+                if 0 <= xx < W and 0 <= yy < H:
+                    idx = (yy * W + xx) * 3
+                    px[idx] = 74
+                    px[idx + 1] = 112
+                    px[idx + 2] = 52
 
-    # Calyx: 5 lens leaves fanning from the apex. Leaf bases sink
-    # ~14 px into the berry so the calyx sits on the fruit instead of
-    # floating above it; shorter leaves read less spiky.
-    sink = 14.0
-    sang = math.radians(angle_deg)
-    base = (apex[0] - math.sin(sang) * sink,
-            apex[1] + math.cos(sang) * sink)
-    scales = [0.78, 0.92, 1.0, 0.92, 0.78]
-    for i, spread in enumerate([-68, -34, 0, 34, 68]):
-        draw_leaf(cv, base, angle_deg, spread,
-                  scales[i] * 0.27 * w, 0.035 * w)
-    draw_stem(cv, apex, angle_deg)
-
-    # Water droplets.
-    for (du, dv, rad) in droplets:
-        lx = du * hw2
-        ly = (dv - 0.5) * h
-        x = cx + lx * ca - ly * sa
-        y = cy + lx * sa + ly * ca
-        draw_droplet(cv, x, y, rad)
+    # --- Warm vignette to hold the eye on the plate. ---
+    # Squared distance keeps this pass cheap (no sqrt per pixel).
+    for y in range(H):
+        ey = (y - 500.0) / 640.0
+        ey2 = ey * ey
+        row = y * W * 3
+        for x in range(W):
+            ex = (x - 512.0) / 640.0
+            vg = smooth(0.85, 2.10, ex * ex + ey2) * 0.10
+            if vg > 0.0:
+                idx = row + x * 3
+                px[idx] = int(px[idx] * (1.0 - vg))
+                px[idx + 1] = int(px[idx + 1] * (1.0 - vg))
+                px[idx + 2] = int(px[idx + 2] * (1.0 - vg))
+    return px
 
 
-def write_png(path, cv):
+def write_png(path, px):
+    """Minimal hand-rolled PNG writer: RGB, filter 0, zlib level 6."""
     raw = bytearray()
+    stride = W * 3
     for y in range(H):
         raw.append(0)
-        raw += cv.px[y * W * 3:(y + 1) * W * 3]
-    data = zlib.compress(bytes(raw), 9)
+        raw += px[y * stride:(y + 1) * stride]
+    comp = zlib.compress(bytes(raw), 6)
 
-    def chunk(kind, payload):
-        c = struct.pack(">I", len(payload)) + kind + payload
-        c += struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    def chunk(kind, data):
+        c = struct.pack(">I", len(data)) + kind + data
+        c += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
         return c
 
     ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", data) + chunk(b"IEND", b""))
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", ihdr)
+    png += chunk(b"IDAT", comp)
+    png += chunk(b"IEND", b"")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(png)
     return len(png)
 
 
-def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "/output/entry.png"
-    cv = Canvas()
-    background(cv)
-    plate(cv)
-    # Back berries first, hero last.
-    berry(cv, 300, 430, 240, 300, -14,
-          [(-0.30, 0.45, 4.0), (0.25, 0.60, 4.0)])
-    berry(cv, 716, 425, 232, 292, 12,
-          [(0.30, 0.42, 4.0), (-0.20, 0.62, 4.0)])
-    berry(cv, 512, 620, 330, 400, -3,
-          [(-0.45, 0.35, 5.0), (0.10, 0.50, 5.0), (-0.15, 0.65, 4.5),
-           (0.35, 0.42, 4.5), (0.00, 0.78, 4.0)])
-    n = write_png(out, cv)
-    print(f"wrote {out} ({n} bytes)")
+def main(argv):
+    out = argv[1] if len(argv) > 1 else "/output/entry.png"
+    px = render()
+    size = write_png(out, px)
+    print(f"wrote {out} ({W}x{H}, {size} bytes)")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv)

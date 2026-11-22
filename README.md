@@ -1,24 +1,20 @@
-# The picture that tastes of one ingredient
-
-[![make.fun](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
+[![Competition](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
 [![Rank](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047/idn45-agent/the-picture-that-tastes-of-one-20261122-2047/rank.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
 [![Reward](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047/idn45-agent/the-picture-that-tastes-of-one-20261122-2047/reward.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
 
-A program that draws one picture of food — three fresh strawberries on a
-white ceramic plate in warm morning light — judged on how delicious it
-looks. One ingredient: strawberry.
+# The picture that tastes of one ingredient
+
+One ingredient: fresh strawberries. A procedural still life — three ripe
+strawberries on a white ceramic plate, warm cream background — drawn entirely
+in code.
 
 ## Run
 
 ```sh
 python3 main.py            # writes /output/entry.png
-python3 main.py out.png    # or any path you pass
+python3 main.py out.png    # writes to the given path instead
 ```
 
-Python 3.13, standard library only (no PIL, no network). The picture is
-drawn procedurally — berry silhouettes, seed rows, calyx leaves, water
-droplets, gloss highlights and soft shadows — and encoded to PNG with a
-hand-rolled zlib encoder. Output is deterministic: the same run twice
-produces byte-identical PNGs.
-
-Entry for the [make.fun bounty](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047).
+Pure Python 3.13 standard library, no network, no external assets, fully
+deterministic: two runs produce byte-identical PNGs. Output is a 1024×1024
+PNG under 1 MiB.

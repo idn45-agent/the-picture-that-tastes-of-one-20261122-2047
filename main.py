@@ -163,12 +163,12 @@ def plate(cv):
 
 def berry_halfwidth(v):
     """Half-width factor at normalised height v in [0,1], top to tip."""
-    hw = (1.0 - v ** 2.6) ** 0.42 * (0.94 + 0.06 * math.cos(math.pi * v))
+    hw = (1.0 - v ** 3.0) ** 0.42 * (0.94 + 0.06 * math.cos(math.pi * v))
     if v < 0.18:
         # Narrower at the very top so the shoulder rounds over instead
         # of ending in a flat, square-cut top edge.
-        hw *= 0.42 + 0.58 * math.sin(math.pi / 2 * v / 0.18)
-    hw *= 1.0 - 0.07 * v  # gentle side taper, less cylindrical body
+        hw *= 0.25 + 0.75 * math.sin(math.pi / 2 * v / 0.18)
+    hw *= 1.0 - 0.12 * v  # stronger taper toward the tip
     return hw
 
 
@@ -185,13 +185,13 @@ def berry_colour(u, v, hw):
     tip = 1.0 - 0.16 * v * v
     ridge = 1.0 + 0.035 * math.sin(9 * u + 3 * v)
     r, g, b = c[0] * tip * ridge, c[1] * tip * ridge, c[2] * tip * ridge
-    # Soft white gloss, upper-left of the berry (kept compact so it
-    # reads as a highlight, not a pale wash across the berry).
-    du = (u + 0.38) / 0.32
-    dv = (v - 0.30) / 0.22
+    # Soft white gloss, upper-left of the berry: kept small and tight
+    # so it reads as a highlight, not a pale wash across the berry.
+    du = (u + 0.42) / 0.22
+    dv = (v - 0.28) / 0.16
     d2 = du * du + dv * dv
     if d2 < 1.0:
-        a = (1.0 - d2) * 0.45
+        a = (1.0 - d2) * 0.35
         r = lerp(r, 255, a)
         g = lerp(g, 235, a)
         b = lerp(b, 220, a)
@@ -278,8 +278,8 @@ def berry(cv, cx, cy, w, h, angle_deg, droplets):
     apex = (ax, ay)
 
     # Seeds: rows v, spacing 0.30 in u, alternate rows shifted half a step.
-    seed_rows = [0.28, 0.40, 0.52, 0.64, 0.76, 0.86]
-    srx, sry = 0.011 * w, 0.014 * h
+    seed_rows = [0.20, 0.28, 0.40, 0.52, 0.64, 0.76, 0.86, 0.93]
+    srx, sry = 0.0135 * w, 0.017 * h
     for ri, v in enumerate(seed_rows):
         hw = berry_halfwidth(v)
         off = 0.15 if ri % 2 else 0.0
